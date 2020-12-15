@@ -30,3 +30,24 @@ RID& RID::operator=(RID &rid){
     return (*this);
 }
 
+RC RID::GetPageNum(PageNum &pageNum) const{
+    if(isValid){
+        pageNum = this->pageNum;
+    }
+    else{
+        return RID_NOT_VIABLE;
+    }
+
+    return OK_RC;
+}
+
+RC RID::GetSlotNum(SlotNum &slotNum) const{
+    if(isValid){
+        slotNum = this->slotNum;
+    }
+    else{
+        return RID_NOT_VIABLE;
+    }
+
+    return OK_RC;
+}

@@ -21,7 +21,7 @@
 #include "redbase.h"
 #include "rm_rid.h"
 #include "pf.h"
-
+#include<string>
 
 struct RM_FileHeaderPage{
     int recordSize;                             //the size of the records in the file
@@ -38,6 +38,7 @@ struct RM_FileHeaderPage{
 //
 class RM_Record {
     friend class RM_FileHandle;
+    friend class RM_FileScan;
 public:
     RM_Record ();
     ~RM_Record();
@@ -45,6 +46,8 @@ public:
     // Return the data corresponding to the record.  Sets *pData to the
     // record contents.
     RC GetData(char *&pData) const;
+    RM_Record(const RM_Record &rec);
+    RM_Record& operator=(const RM_Record& rec);
 
     // Return the RID associated with the record
     RC GetRid (RID &rid) const;
@@ -61,7 +64,9 @@ private:
 //
 class RM_FileHandle {
     friend class RM_FileScan;
+    friend class RM_Manager;
 public:
+
     RM_FileHandle ();
     ~RM_FileHandle();
 
@@ -95,7 +100,7 @@ private:
     bool isHeaderModified;                               // Modified flag for the file header
     PF_FileHandle pfFH;                                // PF file handle
     RM_FileHeaderPage fileHeader;                      // File handle information
-    int getRecordOffset(int slowNum) const;
+    int GetRecordOffset(int slowNum) const;
 
  };
 
@@ -128,6 +133,14 @@ private:
     void *value;
     ClientHint pinHint;
     bool isScanOpen;
+
+    bool isSlotInBitMap(SlotNum slotNum,char* bitmap);
+    int GetIntValue(char* rData);
+    float GetFloatValue(char* rData);
+    std::string GetStringValue(char* rData);
+
+    template<typename T>
+    bool matchRecord(T rValue, T gValue);
 
 };
 
@@ -169,6 +182,8 @@ void RM_PrintError(RC rc);
 #define RM_INVALID_OFFEST                      (START_RM_WARN + 15) // NULL Record
 #define RM_INVALID_OPERATOR               (START_RM_WARN + 16) // NULL Record
 #define RM_ATTRIBUTE_NOT_CONSISTENT    (START_RM_WARN + 17) // NULL Record
+#define RM_EOF                                                             (START_RM_WARN + 18)
 //ERRORS
 #define RM_INCONSISTENT_BITMAP  (START_RM_ERR - 1) // Inconsistent bitmap in page
+#define RM_RECORD_NOT_VALID                     (START_RM_WARN + 19)
 #endif

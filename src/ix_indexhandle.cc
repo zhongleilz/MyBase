@@ -822,3 +822,181 @@ RC IX_IndexHandle::InsertEntry(void* pData, const RID &rid){
         return OK_RC;
     }
 }
+
+
+
+bool IX_IndexHandle::compareRIDs(const RID &rid1, const RID &rid2) {
+    PageNum pageNum1, pageNum2;
+    SlotNum slotNum1, slotNum2;
+
+    rid1.GetPageNum(pageNum1);
+    rid1.GetSlotNum(slotNum1);
+    rid2.GetPageNum(pageNum2);
+    rid2.GetSlotNum(slotNum2);
+
+    return (pageNum1 == pageNum2 && slotNum1 == slotNum2);
+}
+
+RC IX_IndexHandle::ForcePages() {
+
+    int rc;
+
+    // 獲得第一個page
+    PageNum pageNum;
+    PF_PageHandle pfPH;
+    if ((rc = pfFH.GetFirstPage(pfPH))) {
+        return rc;
+    }
+    if ((rc = pfPH.GetPageNum(pageNum))) {
+        return rc;
+    }
+
+    // 獲得下一個page
+    PageNum nextPage;
+    PF_PageHandle nextPFPH;
+    while (true) {
+        if ((rc = pfFH.GetNextPage(pageNum, nextPFPH))) {
+            return rc;
+        }
+        if ((rc = pfFH.UnpinPage(pageNum))) {
+            return rc;
+        }
+
+        // 使用PF FileHandle Force the pages 
+        if ((rc = pfFH.ForcePages(pageNum))) {
+            return rc;
+        }
+
+        if ((rc = nextPFPH.GetPageNum(nextPage))) {
+            if (rc == PF_EOF) {
+                break;
+            }
+            return rc;
+        }
+
+        pageNum = nextPage;
+    }
+
+    // Return OK
+    return OK_RC;
+}
+
+
+RC IX_IndexHandle::SearchEntry(void* pData, PageNum node, PageNum &pageNumber) {
+    int rc;
+
+    if (node == IX_NO_PAGE) {
+        return IX_DELETE_ENTRY_NOT_FOUND;
+    }
+
+    PF_PageHandle pfPH;
+    if ((rc = pfFH.GetThisPage(node, pfPH))) {
+        return rc;
+    }
+    char* nodeData;
+    if ((rc = pfPH.GetData(nodeData))) {
+        return rc;
+    }
+
+    AttrType attrType = indexHeader.attrType;
+    int attrLength = indexHeader.attrLength;
+    int degree = indexHeader.degree;
+
+    IX_NodeHeader* nodeHeader = (IX_NodeHeader*) nodeData;
+    IX_NodeType nodeType = nodeHeader->type;
+    int numberKeys = nodeHeader->numberKeys;
+    char* keyData = nodeData + sizeof(IX_NodeHeader);
+    char* valueData = keyData + attrLength*degree;
+    IX_NodeValue* valueArray = (IX_NodeValue*) valueData;
+
+    if (nodeType == LEAF || nodeType == ROOT_LEAF) {
+        pageNumber = node;
+
+        if ((rc = pfFH.UnpinPage(node))) {
+            return rc;
+        }
+    }
+
+    else if (nodeType == NODE || nodeType == ROOT) {
+        PageNum nextPage = IX_NO_PAGE;
+        if (attrType == INT) {
+            int* keyArray = (int*) keyData;
+            int intValue = *static_cast<int*>(pData);
+            if (intValue < keyArray[0]) {
+                nextPage = valueArray[0].page;
+            }
+            else if (intValue >= keyArray[numberKeys-1]) {
+                nextPage = valueArray[numberKeys].page;
+            }
+            else {
+                bool found;
+                for (int i=1; i<numberKeys; i++) {
+                    if (satisfiesInterval(keyArray[i-1], keyArray[i], intValue)) {
+                        nextPage = valueArray[i].page;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) nextPage = valueArray[numberKeys].page;
+            }
+        }
+        else if (attrType == FLOAT) {
+            float* keyArray = (float*) keyData;
+            float floatValue = *static_cast<float*>(pData);
+            if (floatValue < keyArray[0]) {
+                nextPage = valueArray[0].page;
+            }
+            else if (floatValue >= keyArray[numberKeys-1]) {
+                nextPage = valueArray[numberKeys].page;
+            }
+            else {
+                bool found;
+                for (int i=1; i<numberKeys; i++) {
+                    if (satisfiesInterval(keyArray[i-1], keyArray[i], floatValue)) {
+                        nextPage = valueArray[i].page;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) nextPage = valueArray[numberKeys].page;
+            }
+        }
+        else {
+            char* keyArray = (char*) keyData;
+            char* valueChar = static_cast<char*>(pData);
+            string stringValue(valueChar);
+            string firstKey(keyArray);
+            string lastKey(keyArray + (numberKeys-1)*attrLength);
+            if (stringValue < firstKey) {
+                nextPage = valueArray[0].page;
+            }
+            else if (stringValue >= lastKey) {
+                nextPage = valueArray[numberKeys].page;
+            }
+            else {
+                bool found;
+                for (int i=1; i<numberKeys; i++) {
+                    string currentKey(keyArray + i*attrLength);
+                    string previousKey(keyArray + (i-1)*attrLength);
+                    if (satisfiesInterval(previousKey, currentKey, stringValue)) {
+                        nextPage = valueArray[i].page;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) nextPage = valueArray[numberKeys].page;
+            }
+        }
+
+        if ((rc = pfFH.UnpinPage(node))) {
+            return rc;
+        }
+
+        if ((rc = SearchEntry(pData, nextPage, pageNumber))) {
+            return rc;
+        }
+    }
+
+    // Return OK
+    return OK_RC;
+}

@@ -1000,3 +1000,445 @@ RC IX_IndexHandle::SearchEntry(void* pData, PageNum node, PageNum &pageNumber) {
     // Return OK
     return OK_RC;
 }
+
+
+RC IX_IndexHandle::DeleteFromLeaf(void* pData, const RID &rid, PageNum node) {
+    int rc;
+
+    bool disposeFlag = false;
+    bool isRoot = false;
+    // 獲得 the node data
+    PF_PageHandle pfPH;
+    char* nodeData;
+    if ((rc = pfFH.GetThisPage(node, pfPH))) {
+        return rc;
+    }
+    if ((rc = pfPH.GetData(nodeData))) {
+        return rc;
+    }
+    if ((rc = pfFH.MarkDirty(node))) {
+        return rc;
+    }
+
+    AttrType attrType = indexHeader.attrType;
+    int attrLength = indexHeader.attrLength;
+    int degree = indexHeader.degree;
+    IX_NodeHeader* nodeHeader = (IX_NodeHeader*) nodeData;
+    int numberKeys = nodeHeader->numberKeys;
+    char* keyData = nodeData + sizeof(IX_NodeHeader);
+    char* valueData = keyData + attrLength*degree;
+    IX_NodeValue* valueArray = (IX_NodeValue*) valueData;
+    int keyPosition = -1;
+
+    if (attrType == INT) {
+        int* keyArray = (int*) keyData;
+        int givenValue = *static_cast<int*>(pData);
+        for (int i=0; i<numberKeys; i++) {
+            if (keyArray[i] == givenValue) {
+                keyPosition = i;
+                break;
+            }
+        }
+    }
+    else if (attrType == FLOAT) {
+        float* keyArray = (float*) keyData;
+        float givenValue = *static_cast<float*>(pData);
+        for (int i=0; i<numberKeys; i++) {
+            if (keyArray[i] == givenValue) {
+                keyPosition = i;
+                break;
+            }
+        }
+    }
+    else {
+        char* keyArray = (char*) keyData;
+        char* givenValueChar = static_cast<char*>(pData);
+        string givenValue(givenValueChar);
+        for (int i=0; i<numberKeys; i++) {
+            string currentKey(keyArray + i*attrLength);
+            if (currentKey == givenValue) {
+                keyPosition = i;
+                break;
+            }
+        }
+    }
+
+    // 未找到
+    if (keyPosition == -1) {
+        return IX_DELETE_ENTRY_NOT_FOUND;
+    }
+    else {
+        // 檢查RID位置是否匹配
+        IX_NodeValue value = valueArray[keyPosition];
+        PageNum bucketPage = value.page;
+
+        PageNum p;
+        SlotNum s;
+        if ((rc = value.rid.GetPageNum(p)) || (rc = value.rid.GetSlotNum(s))) return rc;
+
+        if (compareRIDs(rid, value.rid)) {
+            // bucket 存在
+            if (bucketPage != IX_NO_PAGE) {
+                // 獲得 bucket data
+                PF_PageHandle bucketPH;
+                char* bucketData;
+                if ((rc = pfFH.GetThisPage(bucketPage, bucketPH))) {
+                    return rc;
+                }
+                if ((rc = bucketPH.GetData(bucketData))) {
+                    return rc;
+                }
+                if ((rc = pfFH.MarkDirty(bucketPage))) {
+                    return rc;
+                }
+
+                IX_BucketPageHeader* bucketHeader = (IX_BucketPageHeader*) bucketData;
+                int numberRecords = bucketHeader->numberRecords;
+                char* ridData = bucketData + sizeof(IX_BucketPageHeader);
+                RID* ridList = (RID*) ridData;
+
+                // 從bucket中獲得最後的RID
+                RID newRID = ridList[numberRecords-1];
+                valueArray[keyPosition].rid = newRID;
+                bucketHeader->numberRecords--;
+                memcpy(bucketData, (char*) bucketHeader, sizeof(IX_BucketPageHeader));
+                if ((rc = pfFH.UnpinPage(bucketPage))) {
+                    return rc;
+                }
+
+                // 如果bucket空，Dispose bucket page
+                if(bucketHeader->numberRecords == 0) {
+                    valueArray[keyPosition].page = IX_NO_PAGE;
+                    if ((rc = pfFH.DisposePage(bucketPage))) {
+                        return rc;
+                    }
+                }
+            }
+
+            // bucket不存在
+            else {
+                // 將key，value移動到左邊
+                for (int i=keyPosition+1; i<numberKeys; i++) {
+                    if (attrType == INT) {
+                        int* keyArray = (int*) keyData;
+                        keyArray[i-1] = keyArray[i];
+                        memcpy(keyData, (char*) keyArray, attrLength*degree);
+                    }
+                    else if (attrType == FLOAT) {
+                        float* keyArray = (float*) keyData;
+                        keyArray[i-1] = keyArray[i];
+                        memcpy(keyData, (char*) keyArray, attrLength*degree);
+                    }
+                    else {
+                        char* keyArray = (char*) keyData;
+                        for (int j=0; j<attrLength; j++) {
+                            keyArray[(i-1)*attrLength + j] = keyArray[i*attrLength + j];
+                        }
+                        memcpy(keyData, (char*) keyArray, attrLength*degree);
+                    }
+                    valueArray[i-1] = valueArray[i];
+                }
+                nodeHeader->numberKeys--;
+
+                // 檢查 node是否爲空
+                if (nodeHeader->numberKeys == 0) {
+                    disposeFlag = true;
+
+                    // 改變左page的指針
+                    PageNum right = valueArray[degree].page;
+                    PageNum left = nodeHeader->left;
+                    if (left != IX_NO_PAGE) {
+                        PF_PageHandle leftPH;
+                        char* leftData;
+                        if ((rc = pfFH.GetThisPage(left, leftPH))) {
+                            return rc;
+                        }
+                        if ((rc = leftPH.GetData(leftData))) {
+                            return rc;
+                        }
+                        if ((rc = pfFH.MarkDirty(left))) {
+                            return rc;
+                        }
+
+                        char* leftValueData = leftData + sizeof(IX_NodeHeader) + attrLength*degree;
+                        IX_NodeValue* leftValueArray = (IX_NodeValue*) leftValueData;
+                        leftValueArray[degree].page = right;
+                        memcpy(leftValueData, (char*) leftValueArray, sizeof(IX_NodeValue)*(degree+1));
+
+                        if ((rc = pfFH.UnpinPage(left))) {
+                            return rc;
+                        }
+                    }
+
+                    // 改變右page的指針
+                    if (right != IX_NO_PAGE) {
+                        PF_PageHandle rightPH;
+                        char* rightData;
+                        if ((rc = pfFH.GetThisPage(right, rightPH))) {
+                            return rc;
+                        }
+                        if ((rc = rightPH.GetData(rightData))) {
+                            return rc;
+                        }
+                        if ((rc = pfFH.MarkDirty(right))) {
+                            return rc;
+                        }
+
+                        IX_NodeHeader* rightHeader = (IX_NodeHeader*) rightData;
+                        rightHeader->left = left;
+                        memcpy(rightData, (char*) rightHeader, sizeof(IX_NodeHeader));
+
+                        if ((rc = pfFH.UnpinPage(right))) {
+                            return rc;
+                        }
+                    }
+
+                    PageNum parent = nodeHeader->parent;
+                    if (parent == IX_NO_PAGE) {
+                        isRoot = true;
+                    }
+                    else {
+                        if ((rc = pushDeletionUp(parent, node))) {
+                            return rc;
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            if (bucketPage != IX_NO_PAGE) {
+                PF_PageHandle bucketPH;
+                char* bucketData;
+                if ((rc = pfFH.GetThisPage(bucketPage, bucketPH))) {
+                    return rc;
+                }
+                if ((rc = bucketPH.GetData(bucketData))) {
+                    return rc;
+                }
+                if ((rc = pfFH.MarkDirty(bucketPage))) {
+                    return rc;
+                }
+
+                IX_BucketPageHeader* bucketHeader = (IX_BucketPageHeader*) bucketData;
+                int numberRecords = bucketHeader->numberRecords;
+                char* ridData = bucketData + sizeof(IX_BucketPageHeader);
+                RID* ridList = (RID*) ridData;
+
+                // Search RID
+                int position = -1;
+                for (int i=0; i<numberRecords; i++) {
+                    if (compareRIDs(ridList[i], rid)) {
+                        position = i;
+                        break;
+                    }
+                }
+                if (position == -1) {
+                    return IX_DELETE_ENTRY_NOT_FOUND;
+                }
+
+                // 左移RIDs
+                for (int i=position+1; i<numberRecords; i++) {
+                    ridList[i-1] = ridList[i];
+                }
+                bucketHeader->numberRecords--;
+                memcpy(bucketData, (char*) bucketHeader, sizeof(IX_BucketPageHeader));
+                memcpy(ridData, (char*) ridList, sizeof(RID)*bucketHeader->numberRecords);
+
+                if ((rc = pfFH.UnpinPage(bucketPage))) {
+                    return rc;
+                }
+
+                if(bucketHeader->numberRecords == 0) {
+                    valueArray[keyPosition].page = IX_NO_PAGE;
+                    if ((rc = pfFH.DisposePage(bucketPage))) {
+                        return rc;
+                    }
+                }
+            }
+
+            else {
+                return IX_DELETE_ENTRY_NOT_FOUND;
+            }
+        }
+
+       
+        memcpy(nodeData, (char*) nodeHeader, sizeof(IX_NodeHeader));
+        memcpy(valueData, (char*) valueArray, sizeof(IX_NodeValue)*(degree+1));
+
+        if ((rc = pfFH.UnpinPage(node))) {
+            return rc;
+        }
+
+        if (disposeFlag && !isRoot) {
+            if ((rc = pfFH.DisposePage(node))) {
+                return rc;
+            }
+        }
+    }
+
+    return OK_RC;
+}
+
+
+RC IX_IndexHandle::pushDeletionUp(PageNum node, PageNum child) {
+    int rc;
+    bool disposeFlag = false;
+
+    if (node == IX_NO_PAGE) {
+        return IX_INCONSISTENT_NODE;
+    }
+
+    // 獲得 node data
+    PF_PageHandle pfPH;
+    char* nodeData;
+    if ((rc = pfFH.GetThisPage(node, pfPH))) {
+        return rc;
+    }
+    if ((rc = pfPH.GetData(nodeData))) {
+        return rc;
+    }
+    if ((rc = pfFH.MarkDirty(node))) {
+        return rc;
+    }
+
+    int attrLength = indexHeader.attrLength;
+    AttrType attrType = indexHeader.attrType;
+    int degree = indexHeader.degree;
+    IX_NodeHeader* nodeHeader = (IX_NodeHeader*) nodeData;
+    char* keyData = nodeData + sizeof(IX_NodeHeader);
+    char* valueData = keyData + attrLength*degree;
+    IX_NodeValue* valueArray = (IX_NodeValue*) valueData;
+    int numberKeys = nodeHeader->numberKeys;
+    IX_NodeType type = nodeHeader->type;
+
+
+    // 尋找key的位置
+    int keyPosition = -1;
+    for (int i=0; i<=numberKeys; i++) {
+        if (valueArray[i].page == child) {
+            keyPosition = i;
+        }
+    }
+
+    // 只有一個key
+    if (numberKeys == 1) {
+        if (keyPosition == -1) {
+            return IX_INCONSISTENT_NODE;
+        }
+        else {
+            valueArray[keyPosition].page = IX_NO_PAGE;
+        }
+
+        memcpy(valueData, (char*) valueArray, sizeof(IX_NodeValue)*(degree+1));
+    }
+
+    else {
+        // keys和value左移
+        if (keyPosition == -1) {
+            return IX_INCONSISTENT_NODE;
+        }
+        else if (keyPosition == 0) {
+            if (attrType == INT) {
+                int* keyArray = (int*) keyData;
+                for (int i=1; i<numberKeys; i++) {
+                    keyArray[i-1] = keyArray[i];
+                    valueArray[i-1] = valueArray[i];
+                }
+                valueArray[numberKeys-1] = valueArray[numberKeys];
+                memcpy(keyData, (char*) keyArray, attrLength*degree);
+            }
+            else if (attrType == FLOAT) {
+                float* keyArray = (float*) keyData;
+                for (int i=1; i<numberKeys; i++) {
+                    keyArray[i-1] = keyArray[i];
+                    valueArray[i-1] = valueArray[i];
+                }
+                valueArray[numberKeys-1] = valueArray[numberKeys];
+                memcpy(keyData, (char*) keyArray, attrLength*degree);
+            }
+            else {
+                char* keyArray = (char*) keyData;
+                for (int i=1; i<numberKeys; i++) {
+                    for (int j=0; j<attrLength; j++) {
+                        keyArray[(i-1)*attrLength + j] = keyArray[i*attrLength + j];
+                    }
+                    valueArray[i-1] = valueArray[i];
+                }
+                valueArray[numberKeys-1] = valueArray[numberKeys];
+                memcpy(keyData, (char*) keyArray, attrLength*degree);
+            }
+        }
+        else {
+            if (attrType == INT) {
+                int* keyArray = (int*) keyData;
+                for (int i=keyPosition; i<numberKeys; i++) {
+                    keyArray[i-1] = keyArray[i];
+                    valueArray[i] = valueArray[i+1];
+                }
+                memcpy(keyData, (char*) keyArray, attrLength*degree);
+            }
+            else if (attrType == FLOAT) {
+                float* keyArray = (float*) keyData;
+                for (int i=keyPosition; i<numberKeys; i++) {
+                    keyArray[i-1] = keyArray[i];
+                    valueArray[i] = valueArray[i+1];
+                }
+                memcpy(keyData, (char*) keyArray, attrLength*degree);
+            }
+            else {
+                char* keyArray = (char*) keyData;
+                for (int i=keyPosition; i<numberKeys; i++) {
+                    for (int j=0; j<attrLength; j++) {
+                        keyArray[(i-1)*attrLength + j] = keyArray[i*attrLength + j];
+                    }
+                    valueArray[i] = valueArray[i+1];
+                }
+                memcpy(keyData, (char*) keyArray, attrLength*degree);
+            }
+        }
+
+        // 更新key的數量
+        nodeHeader->numberKeys--;
+        for (int i=0; i<nodeHeader->numberKeys; i++) {
+
+        }
+
+        // 檢查node爲空
+        if (nodeHeader->numberKeys == 0) {
+            disposeFlag = true;
+
+            // node爲根節點
+            if (type == ROOT) {
+                indexHeader.rootPage = IX_NO_PAGE;
+                headerModified = TRUE;
+            }
+            else {
+                // 遞歸父節點
+                if ((rc = pushDeletionUp(nodeHeader->parent, node))) {
+                    return rc;
+                }
+            }
+        }
+
+        memcpy(nodeData, (char*) nodeHeader, sizeof(IX_NodeHeader));
+        memcpy(valueData, (char*) valueArray, sizeof(IX_NodeValue)*(degree+1));
+    }
+
+
+    if ((rc = pfFH.UnpinPage(node))) {
+        return rc;
+    }
+
+    if (disposeFlag) {
+        if ((rc = pfFH.DisposePage(node))) {
+            return rc;
+        }
+    }
+
+    return OK_RC;
+}
+
+template<typename T>
+bool IX_IndexHandle::satisfiesInterval(T key1, T key2, T value) {
+    return (value >= key1 && value < key2);
+}
